@@ -1,0 +1,1439 @@
+超时到底应该在哪里设置：客户端、网关、RPC 还是数据库？
+
+在分布式系统中，Timeout 是一个看起来简单、实际上非常容易配置错误的问题。
+
+一个典型的后端请求可能经历下面这条链路：
+
+浏览器 / App
+      │
+      ▼
+   Gateway
+      │
+      ▼
+  Service A
+      │
+      ▼
+    RPC
+      │
+      ▼
+  Service B
+      │
+      ▼
+   Redis / MySQL
+
+于是问题来了：
+
+* HTTP 客户端应该设置多少秒？
+* Gateway 应该比客户端短还是长？
+* RPC timeout 应该怎么设置？
+* MySQL query timeout 又应该是多少？
+* Redis timeout 和 RPC timeout 是什么关系？
+* 如果每一层都设置了 3 秒，会发生什么？
+* 如果数据库 timeout 比 RPC timeout 还长，会有什么后果？
+* 请求已经超时返回给用户了，下游为什么还在执行？
+* 为什么明明设置了 timeout，线上仍然会出现大量“卡死”请求？
+
+很多系统的问题，并不是“没有设置超时”，而是：
+
+每一层都设置了 timeout，但这些 timeout 之间没有形成一个完整的时间预算。
+
+这篇文章不讨论某个具体框架的配置项，而是从一个请求的完整生命周期出发，重新理解分布式系统中的 Timeout。
+
+⸻
+
+一、Timeout 到底解决什么问题？
+
+先从一个最简单的问题开始：
+
+Timeout 是为了防止什么？
+
+很多人的第一反应是：
+
+防止请求执行太久。
+
+这个说法没错，但并不完整。
+
+更准确地说：
+
+Timeout 是对一个资源等待行为设置的最大允许时间。
+
+这个资源可以是：
+
+等待连接
+等待线程
+等待队列
+等待网络
+等待 RPC
+等待数据库连接
+等待数据库执行
+等待 Redis
+等待锁
+等待磁盘
+
+所以一个请求的总耗时实际上可能由很多部分组成：
+
+Total Time
+= Queue Wait
++ Connection Wait
++ Network
++ Server Processing
++ DB Wait
++ Serialization
++ Retry
++ ...
+
+这意味着：
+
+timeout = 总执行时间
+
+并不一定成立。
+
+例如一个 HTTP 请求：
+
+客户端 timeout = 3s
+
+并不代表：
+
+数据库最多执行 3s
+
+更不代表：
+
+整个请求最多消耗 3s CPU
+
+它只意味着：
+
+客户端最多愿意等待 3 秒。
+
+这是理解后面所有问题的第一步。
+
+⸻
+
+二、先看一个真实一点的请求链路
+
+假设用户发起：
+
+POST /api/order
+
+请求进入系统之后：
+
+                         3000ms
+Client ──────────────────────────────────────┐
+                                             │
+        Gateway                              │
+        timeout = 2500ms                     │
+             │                               │
+             ▼                               │
+        Service A                            │
+        timeout = 2200ms                     │
+             │                               │
+             ▼                               │
+        RPC Service B                        │
+        timeout = 1800ms                     │
+             │                               │
+             ▼                               │
+        MySQL                                │
+        timeout = 1000ms                     │
+                                             │
+                                             ▼
+                                           return
+
+看起来非常合理：
+
+MySQL < RPC < Service < Gateway < Client
+
+但这里还有一个非常重要的问题：
+
+为什么应该这样设计？
+
+不能简单回答：
+
+因为超时时间应该逐层递减。
+
+这只是表面规律。
+
+真正应该理解的是：
+
+上游拥有的时间预算，必须覆盖它依赖的下游执行时间，以及必要的网络、排队、序列化和清理成本。
+
+所以真正的关系应该是：
+
+上游 Deadline
+        │
+        ├── 自己需要的处理时间
+        │
+        ├── 下游 RPC 时间
+        │      ├── 网络
+        │      ├── 排队
+        │      ├── 服务处理
+        │      └── 下游依赖
+        │
+        └── 返回结果时间
+
+⸻
+
+三、最容易犯的错误：所有地方都设置成 3 秒
+
+线上经常能看到这种配置：
+
+HTTP Client      3s
+Gateway          3s
+RPC              3s
+Redis            3s
+MySQL            3s
+
+看起来非常整齐。
+
+实际上，这种配置很危险。
+
+假设：
+
+Client
+  timeout = 3s
+Gateway
+  timeout = 3s
+Service A
+  timeout = 3s
+RPC
+  timeout = 3s
+Service B
+  timeout = 3s
+MySQL
+  timeout = 3s
+
+现在数据库恰好执行 2.9 秒。
+
+Service B：
+
+RPC 开始
+    │
+    └────────────── 2.9s ──────────────┐
+                                      │
+                                  MySQL 返回
+
+Service B 还需要：
+
+序列化
+网络传输
+RPC 框架处理
+业务逻辑
+
+于是整个 RPC 很可能超过 3 秒。
+
+但是 Service A 也只有 3 秒。
+
+Gateway 也只有 3 秒。
+
+Client 也只有 3 秒。
+
+最终：
+
+Client
+  │
+  │ 3s timeout
+  ▼
+返回 timeout
+
+但数据库可能仍然在执行。
+
+于是出现一个非常经典的现象：
+
+用户：
+“请求失败了。”
+服务：
+“请求已经超时了。”
+数据库：
+“我还在干活。”
+
+⸻
+
+四、Timeout 最核心的概念：Deadline
+
+如果只记住一个概念，我建议记住：
+
+在分布式系统里，Deadline 通常比单纯的 Timeout 更重要。
+
+Timeout 表达的是：
+
+从现在开始最多等待 N 秒。
+
+Deadline 表达的是：
+
+这个请求最晚必须在某个时间点之前完成。
+
+假设：
+
+当前时间：10:00:00.000
+用户要求：
+10:00:03.000 前必须完成
+
+那么：
+
+Deadline = 10:00:03.000
+
+请求经过 Gateway：
+
+10:00:00.200
+
+Gateway 不应该重新认为：
+
+还有 3 秒。
+
+而应该计算：
+
+剩余时间 = 10:00:03.000 - 10:00:00.200
+         = 2.8s
+
+然后把这个 Deadline 继续传递给下游。
+
+这就是：
+
+Deadline Propagation
+
+⸻
+
+五、为什么 Deadline Propagation 比“每层设置 timeout”更可靠？
+
+假设：
+
+Client
+deadline = T + 5s
+
+经过：
+
+Gateway
+
+消耗：
+
+800ms
+
+那么：
+
+Service A
+remaining = 4.2s
+
+Service A 又调用 RPC：
+
+消耗 500ms
+
+Service B 拿到：
+
+remaining = 3.7s
+
+如果 Service B 再调用数据库：
+
+remaining = 3.7s
+
+那么数据库实际上拿到的是：
+
+deadline = 原始 deadline
+
+而不是：
+
+timeout = 3s
+
+于是整个系统共享的是：
+
+同一个时间预算
+
+而不是：
+
+每一层都有一块独立的 3 秒预算。
+
+这两种设计有本质区别。
+
+⸻
+
+六、Go 为什么天然适合做 Deadline Propagation？
+
+Go 中最典型的实现就是：
+
+ctx, cancel := context.WithTimeout(
+    parent,
+    3*time.Second,
+)
+defer cancel()
+
+下游：
+
+func CreateOrder(ctx context.Context) error {
+    return callInventory(ctx)
+}
+
+继续：
+
+func callInventory(ctx context.Context) error {
+    return inventoryClient.Create(ctx)
+}
+
+最终 RPC：
+
+client.Call(ctx, req)
+
+每一层不需要重新发明一个 timeout。
+
+而是：
+
+Request Context
+       │
+       ▼
+   Service A
+       │
+       ▼
+      RPC
+       │
+       ▼
+   Service B
+       │
+       ▼
+    Database
+
+让 Deadline 沿着调用链传播。
+
+⸻
+
+七、Java 也应该有同样的思想
+
+Java 项目中经常出现：
+
+client.setReadTimeout(3000);
+
+然后 RPC：
+
+timeout = 3000ms
+
+数据库：
+
+queryTimeout = 3000s
+
+最后每一层自己管理自己的 timeout。
+
+真正成熟的设计应该逐渐从：
+
+Timeout-based
+
+转向：
+
+Deadline-based
+
+例如请求进入 Service A：
+
+Deadline = 10:00:03
+
+调用 Service B 时：
+
+remaining =
+    Deadline - currentTime
+
+再将剩余时间作为 RPC 的 deadline。
+
+这样才能避免：
+
+A timeout = 3s
+B timeout = 3s
+C timeout = 3s
+D timeout = 3s
+
+导致整个调用链理论上可以跑：
+
+3 + 3 + 3 + 3 = 12s
+
+而用户可能只愿意等待 3 秒。
+
+⸻
+
+八、Gateway 的 Timeout 应该是多少？
+
+Gateway 是最容易配置错误的一层。
+
+例如：
+
+Client
+timeout = 10s
+Gateway
+timeout = 5s
+Service
+timeout = 8s
+
+这时候：
+
+Gateway 5s
+
+实际上已经决定了：
+
+用户即使愿意等待 10 秒，Gateway 也不会等到 Service 8 秒完成。
+
+所以通常需要明确：
+
+Client deadline
+        ↓
+Gateway deadline
+        ↓
+Service deadline
+        ↓
+RPC deadline
+
+但是这里有一个细节：
+
+Gateway 不一定要机械地比 Client 少很多。
+
+因为 Gateway 本身可能还承担：
+
+TLS
+鉴权
+限流
+路由
+负载均衡
+协议转换
+
+所以它需要保留自己的处理预算。
+
+更合理的模型是：
+
+Client Budget
+│
+├── Gateway Budget
+│
+└── Downstream Budget
+
+而不是：
+
+Client = 10s
+Gateway = 9s
+Service = 8s
+RPC = 7s
+DB = 6s
+
+这种“每层减 1 秒”的做法没有理论依据。
+
+⸻
+
+九、RPC Timeout 应该怎么设置？
+
+RPC timeout 最容易犯的错误是：
+
+“接口平均 RT 是 100ms，所以 RPC timeout 设置 200ms。”
+
+平均值没有太大意义。
+
+更值得关注的是：
+
+P50
+P90
+P95
+P99
+P999
+
+例如：
+
+P50 = 20ms
+P95 = 80ms
+P99 = 150ms
+P999 = 800ms
+
+如果设置：
+
+timeout = 100ms
+
+那么：
+
+约 5% 的请求
+
+就可能因为 timeout 被主动取消。
+
+所以 timeout 本质上也是一个 SLA / SLO 问题。
+
+不能脱离：
+
+业务 SLA
++
+下游延迟分布
++
+重试策略
++
+流量模型
+
+单独决定。
+
+⸻
+
+十、数据库 Timeout 更特殊
+
+数据库 timeout 和 RPC timeout 最大的区别是：
+
+客户端 timeout，并不一定意味着数据库端的执行已经停止。
+
+比如：
+
+Service
+   │
+   │ SQL
+   ▼
+MySQL
+   │
+   │ 执行 10s
+   │
+   ├───────────────
+   │
+Service timeout = 3s
+
+3 秒之后：
+
+Service
+   │
+   └── timeout
+
+但 MySQL：
+
+仍然执行
+
+于是就出现：
+
+客户端已经放弃
+        ↓
+数据库还在工作
+        ↓
+连接可能仍被占用
+        ↓
+慢查询越来越多
+        ↓
+连接池越来越满
+        ↓
+新的请求开始等待连接
+
+最终：
+
+一个慢 SQL
+    ↓
+连接池耗尽
+    ↓
+线程阻塞
+    ↓
+接口超时
+    ↓
+重试
+    ↓
+更多 SQL
+
+这也是为什么：
+
+数据库 timeout 不能只看应用侧 timeout。
+
+还需要关注：
+
+数据库自身的 statement timeout
+lock wait timeout
+transaction timeout
+connection timeout
+socket timeout
+
+不同数据库和驱动的语义也可能不同。
+
+⸻
+
+十一、Connection Timeout 和 Query Timeout 千万不要混为一谈
+
+这是线上非常常见的误区。
+
+假设：
+
+connectionTimeout = 1s
+queryTimeout = 3s
+
+它们解决的是两个完全不同的问题。
+
+Connection Timeout
+
+解决：
+
+“我最多等多久才能拿到数据库连接？”
+
+比如：
+
+连接池：
+10 / 10
+新请求：
+等待连接
+
+如果：
+
+connectionTimeout = 1s
+
+那么：
+
+等待 1 秒还拿不到连接
+→ fail
+
+⸻
+
+Query Timeout
+
+解决：
+
+“拿到连接之后，SQL 最多执行多久？”
+
+例如：
+
+拿到 connection
+       ↓
+执行 SQL
+       ↓
+最多 3s
+
+所以完整时间实际上可能是：
+
+Connection Wait
++
+Query Execution
+
+如果两者都设置：
+
+1s + 3s
+
+那么请求并不是：
+
+最多 3s
+
+而可能是：
+
+最多 4s
+
+甚至还要加上：
+
+network
+serialization
+transaction
+connection return
+
+⸻
+
+十二、Timeout + Retry 才是最危险的组合
+
+假设：
+
+RPC timeout = 1s
+retry = 3
+
+很多人会理解成：
+
+最多等待 1 秒。
+
+实际上如果每次 retry 都重新等待 1 秒：
+
+Attempt 1
+   │
+   └── 1s timeout
+Attempt 2
+   │
+   └── 1s timeout
+Attempt 3
+   │
+   └── 1s timeout
+
+理论等待时间：
+
+3s
+
+还没有考虑：
+
+backoff
+network
+queue
+
+更麻烦的是流量放大。
+
+假设：
+
+1000 QPS
+
+下游开始超时。
+
+每个请求重试 3 次。
+
+最坏情况下：
+
+1000
+ ↓
+3000
+ ↓
+9000
+
+如果多个服务形成：
+
+A → B → C
+
+每一层都有 retry：
+
+A retry 3
+B retry 3
+C retry 3
+
+理论请求放大甚至可能接近：
+
+3 × 3 × 3 = 27
+
+这就是典型的：
+
+Retry Amplification
+
+所以：
+
+Timeout
+
+永远不能脱离：
+
+Retry
+
+单独讨论。
+
+⸻
+
+十三、Timeout 和 Cancellation 其实是两个概念
+
+这是一个很容易被忽略的问题。
+
+假设：
+
+Client
+  │
+  │ request
+  ▼
+Service
+  │
+  │ RPC
+  ▼
+Database
+
+Client：
+
+3 秒 timeout
+
+3 秒到了：
+
+Client
+  ↓
+cancel
+
+理想情况下：
+
+Service
+  ↓
+cancel RPC
+  ↓
+Database
+  ↓
+cancel query
+
+最终：
+
+整条链路停止
+
+但如果 cancellation 没有正确传播：
+
+Client
+  ↓
+timeout
+Service
+  ↓
+继续执行
+RPC
+  ↓
+继续执行
+Database
+  ↓
+继续执行
+
+用户已经得到：
+
+timeout
+
+但系统仍然在消耗：
+
+CPU
+线程
+goroutine
+连接
+数据库资源
+
+于是：
+
+Timeout 如果不能伴随 Cancellation，就可能只是“让用户看不到结果”，而不是让系统停止工作。
+
+这点非常重要。
+
+⸻
+
+十四、一个正确的 Timeout 层级应该是什么样？
+
+不能简单给出一个固定数字。
+
+但可以建立一个基本模型：
+
+                    User Deadline
+                          │
+                          ▼
+                    ┌───────────┐
+                    │  Gateway  │
+                    └─────┬─────┘
+                          │
+                          ▼
+                    ┌───────────┐
+                    │ Service A │
+                    └─────┬─────┘
+                          │
+                     RPC Deadline
+                          │
+                          ▼
+                    ┌───────────┐
+                    │ Service B │
+                    └─────┬─────┘
+                          │
+                   DB remaining time
+                          │
+                          ▼
+                    ┌───────────┐
+                    │    DB     │
+                    └───────────┘
+
+核心原则不是：
+
+Client > Gateway > RPC > DB
+
+而是：
+
+任何下游操作的最大允许时间，都必须受到上游剩余 Deadline 的约束。
+
+可以写成：
+
+T_remaining =
+    T_deadline - T_now
+
+而一个下游操作真正允许使用的时间：
+
+T_operation =
+    min(
+        T_remaining,
+        T_local_limit
+    )
+
+这其实是一个非常实用的公式。
+
+例如：
+
+剩余 Deadline = 800ms
+RPC 本地最大允许 = 2s
+最终 RPC timeout：
+min(800ms, 2s)
+= 800ms
+
+反过来：
+
+剩余 Deadline = 5s
+RPC 本地最大允许 = 2s
+最终：
+2s
+
+这才是真正合理的 timeout 计算方式。
+
+⸻
+
+十五、Timeout 不应该只设置一个值
+
+一个成熟的 HTTP/RPC 客户端，通常至少需要考虑：
+
+Connection Timeout
+Write Timeout
+Read Timeout
+Request Timeout
+Idle Timeout
+
+例如：
+
+Connection Timeout
+
+解决：
+
+TCP/TLS 建连太慢
+
+而：
+
+Read Timeout
+
+解决：
+
+连接建立了，但对方迟迟不返回数据
+
+还有：
+
+Request Timeout
+
+解决：
+
+整个请求生命周期超过预算
+
+这几个 timeout 的语义完全不同。
+
+如果把它们全部配置成：
+
+30s
+
+并不能说明系统设计得合理。
+
+⸻
+
+十六、为什么“全局一个 Timeout”通常不是好方案？
+
+假设整个系统统一：
+
+timeout = 5s
+
+看起来管理非常简单。
+
+但实际上不同接口的资源模型完全不同。
+
+例如：
+
+查询用户信息
+P99 = 30ms
+
+和：
+
+导出 100 万条数据
+P99 = 20s
+
+如果都设置：
+
+5s
+
+一定会有一个不合理。
+
+所以 Timeout 应该和：
+
+业务类型
+SLA
+资源成本
+幂等性
+调用链
+失败处理
+
+一起设计。
+
+例如：
+
+普通查询
+    500ms
+核心交易
+    2s
+内部异步任务
+    30s
+批处理
+    不适合使用同步 HTTP timeout
+
+这里实际上已经开始涉及：
+
+同步请求和异步任务的边界。
+
+⸻
+
+十七、如果任务本身就可能执行 30 秒怎么办？
+
+一个很常见的错误是：
+
+HTTP timeout = 60s
+
+然后：
+
+POST /export
+
+服务同步生成一个 500 MB 文件。
+
+用户：
+
+等待 60 秒
+
+这通常不是 Timeout 应该解决的问题。
+
+更合理的设计是：
+
+POST /export
+        │
+        ▼
+创建任务
+        │
+        ▼
+202 Accepted
+        │
+        ▼
+后台执行
+        │
+        ▼
+GET /export/{id}
+
+即：
+
+短请求
+    ↓
+创建异步任务
+    ↓
+后台长任务
+
+所以：
+
+当一个操作的正常执行时间已经超过同步请求能够合理等待的范围时，应该重新设计调用模型，而不是无限增大 timeout。
+
+⸻
+
+十八、Timeout 的真正敌人其实是“没有预算”
+
+很多系统配置 timeout 的方式是：
+
+“这个接口平时 100ms，那就设置 1 秒吧。”
+
+这是经验主义。
+
+更合理的方法是：
+
+业务 SLA
+    ↓
+总时间预算
+    ↓
+拆分调用链
+    ↓
+给每个依赖分配预算
+    ↓
+根据 P99/P999 调整
+    ↓
+结合 Retry / Cancellation
+
+例如一个接口：
+
+SLA = 1s
+
+可以形成：
+
+Gateway          50ms
+Service A       100ms
+RPC             300ms
+Redis            50ms
+MySQL           300ms
+Network/Buffer  100ms
+---------------------
+Total           900ms
+
+这里故意留：
+
+100ms
+
+作为余量。
+
+这比：
+
+所有地方 timeout = 1s
+
+合理得多。
+
+⸻
+
+十九、Timeout 设计中的几个典型反模式
+
+反模式一：所有 timeout 都一样
+
+HTTP = 3s
+RPC = 3s
+Redis = 3s
+MySQL = 3s
+
+问题：
+
+没有时间预算层级
+
+⸻
+
+反模式二：只设置客户端 timeout
+
+Client
+timeout = 3s
+
+但是：
+
+RPC
+∞
+DB
+∞
+
+用户已经放弃：
+
+后台仍然继续执行
+
+⸻
+
+反模式三：只设置 RPC timeout
+
+RPC：
+
+3s
+
+但：
+
+DB = 10s
+
+结果：
+
+RPC timeout
+    ↓
+DB 仍然执行
+
+⸻
+
+反模式四：timeout + 无限 retry
+
+timeout = 1s
+retry = ∞
+
+这不是容错。
+
+这是：
+
+把故障变成持续流量。
+
+⸻
+
+反模式五：为了减少 timeout 错误不断增大 timeout
+
+1s → 3s → 5s → 10s → 30s
+
+如果 timeout 错误越来越多，应该先问：
+
+为什么请求越来越慢？
+
+而不是：
+
+timeout 为什么这么小？
+
+⸻
+
+二十、最终可以形成一个 Timeout 设计公式
+
+对于一个请求：
+
+T_total
+
+应该满足：
+
+T_total <= T_deadline
+
+其中：
+
+T_total =
+    Queue
+  + Connection
+  + Network
+  + Compute
+  + Downstream
+  + Serialization
+  + Retry
+
+而对于每一个下游调用：
+
+T_call <= min(
+    T_remaining,
+    T_local_budget
+)
+
+如果存在 Retry：
+
+T_total =
+    Σ(T_attempt)
+  + Σ(backoff)
+
+同时还必须考虑：
+
+request cancellation
+
+否则：
+
+用户 timeout
+≠
+服务器停止执行
+
+这可能是整篇文章最值得记住的一句话。
+
+⸻
+
+二十一、一个比较完整的推荐配置模型
+
+假设：
+
+用户请求 SLA = 2s
+
+可以考虑：
+
+Client
+    deadline = 2s
+Gateway
+    max request time = 1.9s
+Service A
+    remaining deadline
+RPC
+    remaining deadline
+    local max = 1.5s
+Redis
+    remaining deadline
+    local max = 300ms
+MySQL
+    remaining deadline
+    local max = 800ms
+
+这里没有一个“万能数字”。
+
+真正重要的是：
+
+2s
+ ↓
+时间预算
+ ↓
+逐层传播
+ ↓
+每层只能消耗剩余预算
+ ↓
+超时触发 cancellation
+ ↓
+必要时快速失败
+
+而不是：
+
+每层自己决定：
+“我觉得 3 秒差不多。”
+
+⸻
+
+二十二、最后：如何在生产环境判断 Timeout 是否配置合理？
+
+建议同时观察：
+
+Request P50
+Request P95
+Request P99
+Request P999
+Timeout Rate
+Retry Rate
+Cancellation Rate
+Connection Pool Wait
+RPC Queue Wait
+DB Connection Wait
+DB Query Time
+Downstream Error Rate
+
+尤其要注意：
+
+timeout rate ↑
++
+downstream latency ↑
+
+和：
+
+timeout rate ↑
++
+downstream latency 正常
+
+是完全不同的两个问题。
+
+前者可能是：
+
+真正的性能退化
+
+后者则可能是：
+
+timeout 配置过于激进
+
+⸻
+
+结语：Timeout 不是一个数字，而是一种资源管理策略
+
+回到最开始的问题：
+
+超时到底应该设置在哪里？
+
+答案不是：
+
+客户端
+
+也不是：
+
+Gateway
+
+更不是：
+
+RPC / 数据库
+
+而应该是：
+
+每一层都应该有自己的超时边界，但这些边界必须围绕同一个请求 Deadline 和时间预算协同工作。
+
+一个比较成熟的分布式系统应该形成这样的关系：
+
+                    Deadline
+                       │
+                       ▼
+                    Client
+                       │
+                       ▼
+                    Gateway
+                       │
+                       ▼
+                   Service A
+                       │
+                       ▼
+                      RPC
+                       │
+                       ▼
+                   Service B
+                       │
+                 ┌─────┴─────┐
+                 ▼           ▼
+               Redis       MySQL
+
+每一层都不是简单地：
+
+“设置一个 3 秒 timeout”
+
+而是在回答：
+
+在这个请求剩余的时间里，我还允许这个操作消耗多少资源？
+
+而当 Deadline 到达时，真正成熟的系统也不应该只是：
+
+返回一个 timeout error
+
+而应该尽可能做到：
+
+Deadline exceeded
+        ↓
+Cancellation
+        ↓
+RPC cancellation
+        ↓
+DB cancellation
+        ↓
+释放连接
+        ↓
+释放 goroutine / thread
+        ↓
+停止无意义计算
+
+最终形成一个完整的：
+
+Deadline
+   ↓
+Budget
+   ↓
+Timeout
+   ↓
+Cancellation
+   ↓
+Resource Release
+
+这五个环节，才是分布式系统中 Timeout 真正完整的生命周期。
+
+如果只配置了 Timeout，却没有 Cancellation，那么很多时候你只是让用户更早看到失败，却没有让系统更早停止工作。
+
+而这两件事情，在高并发系统里，有时候差别非常大。
